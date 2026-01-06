@@ -1,0 +1,13 @@
+# Required packages for Telegram Mass Reporting Bot
+
+# Telegram client library
+telethon>=1.34.0
+
+# Async MongoDB driver
+motor>=3.3.2
+
+# For better async support
+asyncio
+
+# Additional dependencies
+pymongo>=4.6.1
