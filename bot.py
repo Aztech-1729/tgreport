@@ -186,8 +186,8 @@ async def post_report_handler(event):
     if len(args) >= 3:
         try:
             cycles = int(args[2])
-            if cycles < 1 or cycles > 100:
-                await event.reply("❌ Cycles must be between 1 and 100.")
+            if cycles < 1:
+                await event.reply("❌ Cycles must be at least 1.")
                 return
         except ValueError:
             await event.reply("❌ Cycles must be a number.")
@@ -230,6 +230,68 @@ async def post_report_handler(event):
     await event.reply(confirm_msg, buttons=buttons)
     logger.info(f"User {user_id} initiated report for {channel_username}/{message_id} with {cycles} cycles")
 
+# --- Command: /user <username> [cycles] ---
+@main_bot.on(events.NewMessage(pattern='/user'))
+async def user_report_handler(event):
+    user_id = event.sender_id
+    
+    if not await is_user_authorized(user_id):
+        return
+
+    args = event.message.text.split()
+    if len(args) < 2:
+        await event.reply(
+            "**Usage:** `/user <username> [cycles]`\n\n"
+            "**Examples:**\n"
+            "`/user johndoe` - Report user once\n"
+            "`/user johndoe 50` - Report user 50 times\n\n"
+            "Note: Username without @"
+        )
+        return
+
+    username = args[1].strip().lstrip('@')  # Remove @ if user adds it
+    cycles = 1
+    
+    # Check if cycles specified
+    if len(args) >= 3:
+        try:
+            cycles = int(args[2])
+            if cycles < 1:
+                await event.reply("❌ Cycles must be at least 1.")
+                return
+        except ValueError:
+            await event.reply("❌ Cycles must be a number.")
+            return
+    
+    # Check if user has any sessions
+    session_count = await user_sessions_col.count_documents({"user_id": user_id, "is_active": True})
+    if session_count == 0:
+        await event.reply("❌ You don't have any active accounts added.\n\nUse `/add` to add accounts first.")
+        return
+
+    # Step 1: Confirm the action
+    confirm_msg = (
+        f"⚠️ **Confirm User Report**\n\n"
+        f"**Target User:** `@{username}`\n"
+        f"**Active Accounts:** {session_count}\n"
+        f"**Cycles:** {cycles}\n"
+        f"**Total Reports:** {session_count * cycles}\n\n"
+        f"**This will report this user from all your authorized accounts.**\n"
+        f"Choose a report reason:"
+    )
+
+    # Create inline buttons for report reasons
+    buttons = [
+        [Button.inline("🚫 Spam", f"reason_user_spam:{username}:{cycles}"),
+         Button.inline("⚔️ Violence", f"reason_user_violence:{username}:{cycles}")],
+        [Button.inline("💰 Fraud", f"reason_user_fraud:{username}:{cycles}"),
+         Button.inline("❗ Other", f"reason_user_other:{username}:{cycles}")],
+        [Button.inline("❌ Cancel", "cancel_report")]
+    ]
+
+    await event.reply(confirm_msg, buttons=buttons)
+    logger.info(f"User {user_id} initiated user report for @{username} with {cycles} cycles")
+
 # --- Command: /channel <link> [cycles] ---
 @main_bot.on(events.NewMessage(pattern='/channel'))
 async def channel_report_handler(event):
@@ -256,8 +318,8 @@ async def channel_report_handler(event):
     if len(args) >= 3:
         try:
             cycles = int(args[2])
-            if cycles < 1 or cycles > 100:
-                await event.reply("❌ Cycles must be between 1 and 100.")
+            if cycles < 1:
+                await event.reply("❌ Cycles must be at least 1.")
                 return
         except ValueError:
             await event.reply("❌ Cycles must be a number.")
@@ -416,7 +478,7 @@ async def callback_handler(event):
             "**💡 Tips:**\n"
             "• Add multiple accounts for more reports\n"
             "• Cycles = how many times each account reports\n"
-            "• Default is 1 cycle, max is 100",
+            "• Default is 1 cycle, no maximum limit",
             buttons=[[Button.inline("🔙 Back to Menu", "back_to_menu")]]
         )
         return
@@ -495,6 +557,51 @@ async def callback_handler(event):
         # Start the channel mass reporting process
         await mass_report_channel(
             channel_username=channel_username,
+            reason=selected_reason,
+            reason_text=reason,
+            initiator_id=user_id,
+            cycles=cycles
+        )
+        return
+    
+    if data.startswith("reason_user_"):
+        # Parse callback data for user reports: reason_user_spam:username:cycles
+        try:
+            parts = data.split(":")
+            logger.info(f"User callback data parts: {parts}")
+            
+            if len(parts) < 3:
+                await event.answer("❌ Invalid callback format", alert=True)
+                logger.error(f"Invalid callback data format: {data}")
+                return
+            
+            # Extract: reason_user_spam, username, cycles
+            reason_part = parts[0]  # "reason_user_spam"
+            reason = reason_part.replace("reason_user_", "")  # "spam"
+            username = parts[1]  # username
+            cycles = int(parts[2]) if len(parts) > 2 else 1  # cycles (default 1)
+            
+            logger.info(f"Parsed - Reason: {reason}, Username: @{username}, Cycles: {cycles}")
+            
+        except (ValueError, IndexError) as e:
+            await event.answer("❌ Invalid callback data", alert=True)
+            logger.error(f"Callback parsing error: {e}, Data: {data}")
+            return
+
+        reason_map = {
+            "spam": InputReportReasonSpam(),
+            "violence": InputReportReasonViolence(),
+            "fraud": InputReportReasonOther(),
+            "other": InputReportReasonOther()
+        }
+        selected_reason = reason_map.get(reason, InputReportReasonSpam())
+
+        await event.edit(f"🔄 Starting mass report for user @{username}...\n\n**Cycles:** {cycles}\n\nThis may take a few moments...")
+        logger.info(f"User {user_id} started user report for @{username} with reason: {reason}, cycles: {cycles}")
+
+        # Start the mass reporting process for user
+        await mass_report_user(
+            username=username,
             reason=selected_reason,
             reason_text=reason,
             initiator_id=user_id,
@@ -616,8 +723,8 @@ async def mass_report_from_all_accounts(channel_username, message_id, reason, re
             report_config = config.REPORT_MESSAGES.get(reason_text, config.REPORT_MESSAGES["other"])
             report_message = report_config["message"]
             
-            # Report using the messages.report method
-            from telethon.tl.functions.messages import ReportRequest
+            # Report using ReportPeerRequest (works for both channels and posts)
+            from telethon.tl.functions.account import ReportPeerRequest
             
             # Send multiple reports from this ONE connection
             account_success = 0
@@ -625,10 +732,10 @@ async def mass_report_from_all_accounts(channel_username, message_id, reason, re
             
             for cycle in range(1, cycles + 1):
                 try:
-                    await user_client(ReportRequest(
+                    # Use ReportPeerRequest which works reliably
+                    await user_client(ReportPeerRequest(
                         peer=target_entity,
-                        id=[message_id],
-                        option=b'',
+                        reason=reason,
                         message=report_message
                     ))
                     
@@ -698,29 +805,315 @@ async def mass_report_from_all_accounts(channel_username, message_id, reason, re
     except:
         pass
 
-    # Send a detailed summary report to the initiating admin
-    summary_msg = (
-        f"📊 **Mass Report Complete**\n\n"
-        f"**Target:** `{channel_username}/{message_id}`\n"
-        f"**Reason:** {reason_text.upper()}\n"
-        f"✅ Successful: {report_results['success']}\n"
-        f"❌ Failed: {report_results['failed']}\n"
-        f"📈 Success Rate: {(report_results['success']/total_sessions*100):.1f}%\n\n"
+    # Create detailed JSON report
+    import json
+    from datetime import datetime as dt
+    
+    report_data = {
+        "report_type": "post",
+        "timestamp": dt.utcnow().isoformat(),
+        "target": {
+            "channel_username": channel_username,
+            "message_id": message_id,
+            "full_link": f"https://t.me/{channel_username}/{message_id}"
+        },
+        "report_reason": {
+            "type": reason_text,
+            "message": config.REPORT_MESSAGES.get(reason_text, {}).get("message", "")
+        },
+        "configuration": {
+            "total_accounts": total_sessions,
+            "cycles_per_account": cycles,
+            "total_reports_attempted": total_reports,
+            "report_delay_seconds": config.REPORT_DELAY
+        },
+        "results": {
+            "successful_reports": report_results['success'],
+            "failed_reports": report_results['failed'],
+            "success_rate_percent": round(success_rate, 2)
+        },
+        "account_details": [],
+        "errors": report_results['errors'],
+        "api_requests": []
+    }
+    
+    # Add account details
+    for detail in report_results['details']:
+        report_data["account_details"].append(detail)
+    
+    # Add API request information
+    for idx, session_data in enumerate(sessions, 1):
+        phone_last4 = session_data.get('account_phone', '')[-4:] if session_data.get('account_phone') else f'#{idx}'
+        account_name = session_data.get('account_name', f'Account #{idx}')
+        
+        # Get reason type name
+        reason_type_name = type(reason).__name__
+        
+        api_info = {
+            "account": f"****{phone_last4}",
+            "account_name": account_name,
+            "api_endpoint": "account.reportPeer",
+            "method": "ReportPeerRequest",
+            "parameters": {
+                "peer": f"@{channel_username}",
+                "message_id": message_id,
+                "reason_type": reason_type_name,
+                "reason": reason_text,
+                "message": config.REPORT_MESSAGES.get(reason_text, {}).get("message", "")[:100] + "..."
+            },
+            "cycles_sent": cycles,
+            "status": "success" if any(phone_last4 in d for d in report_results['details'] if "✅" in d) else "failed"
+        }
+        report_data["api_requests"].append(api_info)
+    
+    # Save to file
+    filename = f"report_{channel_username}_{message_id}_{dt.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(report_data, f, indent=2, ensure_ascii=False)
+    
+    # Send file to user
+    await main_bot.send_file(
+        initiator_id,
+        filename,
+        caption=f"📊 **Detailed Report Log**\n\n"
+                f"✅ Success: {report_results['success']}\n"
+                f"❌ Failed: {report_results['failed']}\n"
+                f"📈 Success Rate: {success_rate:.1f}%"
     )
     
-    # Add details if there are not too many
-    if len(report_results['details']) <= 20:
-        summary_msg += "**Details:**\n" + "\n".join(report_results['details'][:20])
+    # Delete local file
+    import os
+    try:
+        os.remove(filename)
+    except:
+        pass
     
-    if report_results['failed'] > 0 and report_results['errors']:
-        summary_msg += f"\n\n**Common Errors:**\n"
-        # Show first 3 unique errors
-        unique_errors = list(set(report_results['errors']))[:3]
-        for err in unique_errors:
-            summary_msg += f"• {err[:100]}\n"
-    
-    await main_bot.send_message(initiator_id, summary_msg)
     logger.info(f"Mass report completed for user {initiator_id}: {report_results['success']} success, {report_results['failed']} failed")
+
+# --- Core: Mass Report User Function ---
+async def mass_report_user(username, reason, reason_text, initiator_id, cycles=1):
+    """
+    Report a user profile.
+    """
+    from telethon.tl.functions.account import ReportPeerRequest
+    
+    # Get all active sessions for this admin
+    sessions_cursor = user_sessions_col.find({"user_id": initiator_id, "is_active": True})
+    sessions = await sessions_cursor.to_list(length=None)
+
+    if not sessions:
+        logger.warning(f"No active sessions found for user {initiator_id}.")
+        await main_bot.send_message(initiator_id, "❌ No active accounts/sessions found. Add an account first with `/add`.")
+        return
+
+    report_results = {"success": 0, "failed": 0, "errors": [], "details": []}
+    total_sessions = len(sessions)
+    total_reports = total_sessions * cycles
+
+    logger.info(f"Starting user report for {initiator_id} with {total_sessions} sessions, {cycles} cycles")
+
+    # Send initial status message (will be edited)
+    status_msg = await main_bot.send_message(
+        initiator_id,
+        "🔄 **Report Started**\n\n"
+        f"👥 **Total Accounts:** {total_sessions}\n"
+        f"✅ **Success:** 0\n"
+        f"❌ **Failed:** 0\n"
+        f"📈 **Success Rate:** 0%\n"
+        f"🔢 **Total Cycles:** {cycles}"
+    )
+    
+    last_update_time = asyncio.get_event_loop().time()
+    
+    for idx, session_data in enumerate(sessions, 1):
+        user_client = None
+        session_id = str(session_data.get('_id', 'unknown'))
+        account_name = session_data.get('account_name', f'Account #{idx}')
+        phone_last4 = session_data.get('account_phone', '')[-4:] if session_data.get('account_phone') else f'#{idx}'
+        
+        try:
+            # Create a client using the stored session string (ONE connection per account)
+            user_client = TelegramClient(
+                session=StringSession(session_data["session_string"]),
+                api_id=session_data["api_id"],
+                api_hash=session_data["api_hash"]
+            )
+            await user_client.connect()
+
+            # Ensure the client is authorized
+            if not await user_client.is_user_authorized():
+                logger.error(f"Session {session_id} for user_id {initiator_id} is not authorized.")
+                report_results["failed"] += cycles
+                report_results["details"].append(f"❌ {account_name} (****{phone_last4}): Not authorized")
+                await user_client.disconnect()
+                continue
+
+            # Resolve the target user once
+            target_entity = await user_client.get_entity(username)
+            
+            # Get the report message from config
+            report_config = config.REPORT_MESSAGES.get(reason_text, config.REPORT_MESSAGES["other"])
+            report_message = report_config["message"]
+            
+            # Send multiple reports from this ONE connection
+            account_success = 0
+            account_failed = 0
+            
+            for cycle in range(1, cycles + 1):
+                try:
+                    # Report the user
+                    await user_client(ReportPeerRequest(
+                        peer=target_entity,
+                        reason=reason,
+                        message=report_message
+                    ))
+                    
+                    account_success += 1
+                    report_results["success"] += 1
+                    logger.info(f"User report {cycle}/{cycles} from {account_name} (****{phone_last4}) succeeded.")
+                    
+                except Exception as e:
+                    account_failed += 1
+                    report_results["failed"] += 1
+                    logger.error(f"User report {cycle}/{cycles} from {account_name} failed: {e}")
+                
+                # Update status every 1.5 seconds
+                current_time = asyncio.get_event_loop().time()
+                if current_time - last_update_time >= 1.5:
+                    total_done = report_results["success"] + report_results["failed"]
+                    success_rate = (report_results["success"] / total_done * 100) if total_done > 0 else 0
+                    
+                    try:
+                        await status_msg.edit(
+                            "🔄 **Report Started**\n\n"
+                            f"👥 **Total Accounts:** {total_sessions}\n"
+                            f"✅ **Success:** {report_results['success']}\n"
+                            f"❌ **Failed:** {report_results['failed']}\n"
+                            f"📈 **Success Rate:** {success_rate:.1f}%\n"
+                            f"🔢 **Total Cycles:** {cycles}"
+                        )
+                        last_update_time = current_time
+                    except:
+                        pass
+                
+                # Delay between reports (2 seconds)
+                await asyncio.sleep(2)
+            
+            # Summary for this account
+            report_results["details"].append(f"✅ ****{phone_last4}: {account_success}/{cycles} reports sent")
+            
+            # Disconnect client after all cycles
+            await user_client.disconnect()
+            logger.info(f"Disconnected {account_name} after {cycles} user reports")
+
+        except Exception as e:
+            report_results["failed"] += cycles
+            error_msg = str(e)
+            report_results["errors"].append(error_msg)
+            report_results["details"].append(f"❌ ****{phone_last4}: {error_msg[:50]}")
+            logger.error(f"User report failed for session {session_id} ({account_name}): {e}")
+            if user_client:
+                try:
+                    await user_client.disconnect()
+                except:
+                    pass
+    
+    # Final update
+    total_done = report_results["success"] + report_results["failed"]
+    success_rate = (report_results["success"] / total_done * 100) if total_done > 0 else 0
+    
+    try:
+        await status_msg.edit(
+            "✅ **Report Complete**\n\n"
+            f"👥 **Total Accounts:** {total_sessions}\n"
+            f"✅ **Success:** {report_results['success']}\n"
+            f"❌ **Failed:** {report_results['failed']}\n"
+            f"📈 **Success Rate:** {success_rate:.1f}%\n"
+            f"🔢 **Total Cycles:** {cycles}"
+        )
+    except:
+        pass
+
+    # Create detailed JSON report
+    import json
+    from datetime import datetime as dt
+    
+    report_data = {
+        "report_type": "user",
+        "timestamp": dt.utcnow().isoformat(),
+        "target": {
+            "username": username,
+            "full_link": f"https://t.me/{username}"
+        },
+        "report_reason": {
+            "type": reason_text,
+            "message": config.REPORT_MESSAGES.get(reason_text, {}).get("message", "")
+        },
+        "configuration": {
+            "total_accounts": total_sessions,
+            "cycles_per_account": cycles,
+            "total_reports_attempted": total_reports,
+            "report_delay_seconds": config.REPORT_DELAY
+        },
+        "results": {
+            "successful_reports": report_results['success'],
+            "failed_reports": report_results['failed'],
+            "success_rate_percent": round(success_rate, 2)
+        },
+        "account_details": [],
+        "errors": report_results['errors'],
+        "api_requests": []
+    }
+    
+    # Add account details
+    for detail in report_results['details']:
+        report_data["account_details"].append(detail)
+    
+    # Add API request information
+    reason_type_name = type(reason).__name__
+    for idx, session_data in enumerate(sessions, 1):
+        phone_last4 = session_data.get('account_phone', '')[-4:] if session_data.get('account_phone') else f'#{idx}'
+        account_name = session_data.get('account_name', f'Account #{idx}')
+        
+        api_info = {
+            "account": f"****{phone_last4}",
+            "account_name": account_name,
+            "api_endpoint": "account.reportPeer",
+            "method": "ReportPeerRequest",
+            "parameters": {
+                "peer": f"@{username}",
+                "reason_type": reason_type_name,
+                "reason": reason_text,
+                "message": config.REPORT_MESSAGES.get(reason_text, {}).get("message", "")[:100] + "..."
+            },
+            "cycles_sent": cycles,
+            "status": "success" if any(phone_last4 in d for d in report_results['details'] if "✅" in d) else "failed"
+        }
+        report_data["api_requests"].append(api_info)
+    
+    # Save to file
+    filename = f"report_user_{username}_{dt.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(report_data, f, indent=2, ensure_ascii=False)
+    
+    # Send file to user
+    await main_bot.send_file(
+        initiator_id,
+        filename,
+        caption=f"📊 **Detailed Report Log**\n\n"
+                f"✅ Success: {report_results['success']}\n"
+                f"❌ Failed: {report_results['failed']}\n"
+                f"📈 Success Rate: {success_rate:.1f}%"
+    )
+    
+    # Delete local file
+    import os
+    try:
+        os.remove(filename)
+    except:
+        pass
+    
+    logger.info(f"User report completed for {initiator_id}: {report_results['success']} success, {report_results['failed']} failed")
 
 # --- Core: Mass Report Channel Function ---
 async def mass_report_channel(channel_username, reason, reason_text, initiator_id, cycles=1):
@@ -866,28 +1259,87 @@ async def mass_report_channel(channel_username, reason, reason_text, initiator_i
     except:
         pass
 
-    # Send a detailed summary report to the initiating admin
-    summary_msg = (
-        f"📊 **Channel Report Complete**\n\n"
-        f"**Target:** `@{channel_username}`\n"
-        f"**Reason:** {reason_text.upper()}\n"
-        f"✅ Successful: {report_results['success']}\n"
-        f"❌ Failed: {report_results['failed']}\n"
-        f"📈 Success Rate: {(report_results['success']/total_sessions*100):.1f}%\n\n"
+    # Create detailed JSON report
+    import json
+    from datetime import datetime as dt
+    
+    report_data = {
+        "report_type": "channel",
+        "timestamp": dt.utcnow().isoformat(),
+        "target": {
+            "channel_username": channel_username,
+            "full_link": f"https://t.me/{channel_username}"
+        },
+        "report_reason": {
+            "type": reason_text,
+            "message": config.REPORT_MESSAGES.get(reason_text, {}).get("message", "")
+        },
+        "configuration": {
+            "total_accounts": total_sessions,
+            "cycles_per_account": cycles,
+            "total_reports_attempted": total_reports,
+            "report_delay_seconds": config.REPORT_DELAY
+        },
+        "results": {
+            "successful_reports": report_results['success'],
+            "failed_reports": report_results['failed'],
+            "success_rate_percent": round(success_rate, 2)
+        },
+        "account_details": [],
+        "errors": report_results['errors'],
+        "api_requests": []
+    }
+    
+    # Add account details
+    for detail in report_results['details']:
+        report_data["account_details"].append(detail)
+    
+    # Add API request information
+    for idx, session_data in enumerate(sessions, 1):
+        phone_last4 = session_data.get('account_phone', '')[-4:] if session_data.get('account_phone') else f'#{idx}'
+        account_name = session_data.get('account_name', f'Account #{idx}')
+        
+        # Get reason type name
+        reason_type_name = type(reason).__name__
+        
+        api_info = {
+            "account": f"****{phone_last4}",
+            "account_name": account_name,
+            "api_endpoint": "account.reportPeer",
+            "method": "ReportPeerRequest",
+            "parameters": {
+                "peer": f"@{channel_username}",
+                "reason_type": reason_type_name,
+                "reason": reason_text,
+                "message": config.REPORT_MESSAGES.get(reason_text, {}).get("message", "")[:100] + "..."
+            },
+            "cycles_sent": cycles,
+            "status": "success" if any(phone_last4 in d for d in report_results['details'] if "✅" in d) else "failed"
+        }
+        report_data["api_requests"].append(api_info)
+    
+    # Save to file
+    filename = f"report_channel_{channel_username}_{dt.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(report_data, f, indent=2, ensure_ascii=False)
+    
+    # Send file to user
+    await main_bot.send_file(
+        initiator_id,
+        filename,
+        caption=f"📊 **Detailed Report Log**\n\n"
+                f"✅ Success: {report_results['success']}\n"
+                f"❌ Failed: {report_results['failed']}\n"
+                f"📈 Success Rate: {success_rate:.1f}%"
     )
     
-    # Add details if there are not too many
-    if len(report_results['details']) <= 20:
-        summary_msg += "**Details:**\n" + "\n".join(report_results['details'][:20])
+    # Delete local file
+    import os
+    try:
+        os.remove(filename)
+    except:
+        pass
     
-    if report_results['failed'] > 0 and report_results['errors']:
-        summary_msg += f"\n\n**Common Errors:**\n"
-        # Show first 3 unique errors
-        unique_errors = list(set(report_results['errors']))[:3]
-        for err in unique_errors:
-            summary_msg += f"• {err[:100]}\n"
-    
-    await main_bot.send_message(initiator_id, summary_msg)
     logger.info(f"Channel report completed for user {initiator_id}: {report_results['success']} success, {report_results['failed']} failed")
 
 
