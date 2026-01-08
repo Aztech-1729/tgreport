@@ -2,6 +2,7 @@ from telethon import TelegramClient, events, Button
 from telethon.tl.functions.messages import ReportRequest
 from telethon.tl.types import InputReportReasonSpam, InputReportReasonViolence, InputReportReasonOther
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
 import re
 from datetime import datetime
 import motor.motor_asyncio
@@ -35,6 +36,102 @@ user_sessions_col = db[config.USER_SESSIONS_COLLECTION]
 
 # --- Main Bot Client (will be initialized in main()) ---
 main_bot = TelegramClient(config.BOT_SESSION_NAME, config.API_ID, config.API_HASH)
+
+# --- FloodWait-safe UI helpers ---
+_ui_lock = asyncio.Lock()
+_last_ui_action_ts = 0.0
+
+async def _ui_throttle():
+    """Prevent spamming bot UI calls (send/edit) too quickly."""
+    global _last_ui_action_ts
+    async with _ui_lock:
+        now = asyncio.get_event_loop().time()
+        min_interval = getattr(config, 'BOT_UI_MIN_INTERVAL', 1.0)
+        wait_for = (_last_ui_action_ts + min_interval) - now
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        _last_ui_action_ts = asyncio.get_event_loop().time()
+
+async def safe_send_message(client: TelegramClient, *args, **kwargs):
+    """Send a message but never crash the bot on FloodWait.
+
+    Returns the sent Message, or None if sending was skipped due to long FloodWait.
+    """
+    max_wait = getattr(config, 'MAX_FLOOD_WAIT_SECONDS', 300)
+    retries = getattr(config, 'MAX_FLOOD_RETRIES', 3)
+
+    for attempt in range(1, retries + 1):
+        try:
+            await _ui_throttle()
+            return await client.send_message(*args, **kwargs)
+        except FloodWaitError as e:
+            seconds = int(getattr(e, 'seconds', 0) or 0)
+            logger.warning(f"FloodWait on send_message: need wait {seconds}s (attempt {attempt}/{retries})")
+            if seconds <= 0:
+                await asyncio.sleep(1)
+                continue
+            if seconds > max_wait:
+                logger.error(f"FloodWait too long ({seconds}s > {max_wait}s). Skipping send_message.")
+                return None
+            await asyncio.sleep(seconds + 1)
+        except Exception as e:
+            logger.error(f"send_message failed: {e}")
+            return None
+
+    return None
+
+async def safe_edit_message(msg, *args, **kwargs):
+    """Edit a message but never crash the bot on FloodWait."""
+    if msg is None:
+        return None
+
+    max_wait = getattr(config, 'MAX_FLOOD_WAIT_SECONDS', 300)
+    retries = getattr(config, 'MAX_FLOOD_RETRIES', 3)
+
+
+    for attempt in range(1, retries + 1):
+        try:
+            await _ui_throttle()
+            return await msg.edit(*args, **kwargs)
+        except FloodWaitError as e:
+            seconds = int(getattr(e, 'seconds', 0) or 0)
+            logger.warning(f"FloodWait on edit: need wait {seconds}s (attempt {attempt}/{retries})")
+            if seconds <= 0:
+                await asyncio.sleep(1)
+                continue
+            if seconds > max_wait:
+                logger.error(f"FloodWait too long ({seconds}s > {max_wait}s). Skipping edit.")
+                return None
+            await asyncio.sleep(seconds + 1)
+        except Exception:
+            return None
+
+    return None
+
+async def safe_send_file(client: TelegramClient, *args, **kwargs):
+    """Send a file but never crash the bot on FloodWait."""
+    max_wait = getattr(config, 'MAX_FLOOD_WAIT_SECONDS', 300)
+    retries = getattr(config, 'MAX_FLOOD_RETRIES', 3)
+
+    for attempt in range(1, retries + 1):
+        try:
+            await _ui_throttle()
+            return await client.send_file(*args, **kwargs)
+        except FloodWaitError as e:
+            seconds = int(getattr(e, 'seconds', 0) or 0)
+            logger.warning(f"FloodWait on send_file: need wait {seconds}s (attempt {attempt}/{retries})")
+            if seconds <= 0:
+                await asyncio.sleep(1)
+                continue
+            if seconds > max_wait:
+                logger.error(f"FloodWait too long ({seconds}s > {max_wait}s). Skipping send_file.")
+                return None
+            await asyncio.sleep(seconds + 1)
+        except Exception as e:
+            logger.error(f"send_file failed: {e}")
+            return None
+
+    return None
 
 # --- Helper: Check if user is authorized ---
 async def is_user_authorized(user_id):
@@ -671,7 +768,7 @@ async def mass_report_from_all_accounts(channel_username, message_id, reason, re
 
     if not sessions:
         logger.warning(f"No active sessions found for user {initiator_id}.")
-        await main_bot.send_message(initiator_id, "❌ No active accounts/sessions found. Add an account first with `/add`.")
+        await safe_send_message(main_bot, initiator_id, "❌ No active accounts/sessions found. Add an account first with `/add`.")
         return
 
     report_results = {"success": 0, "failed": 0, "errors": [], "details": []}
@@ -681,7 +778,8 @@ async def mass_report_from_all_accounts(channel_username, message_id, reason, re
     logger.info(f"Starting mass report for user {initiator_id} with {total_sessions} sessions, {cycles} cycles")
 
     # Send initial status message (will be edited)
-    status_msg = await main_bot.send_message(
+    status_msg = await safe_send_message(
+        main_bot,
         initiator_id,
         "🔄 **Report Started**\n\n"
         f"**Count:** 0\n"
@@ -743,6 +841,31 @@ async def mass_report_from_all_accounts(channel_username, message_id, reason, re
                     report_results["success"] += 1
                     logger.info(f"Report {cycle}/{cycles} from {account_name} (****{phone_last4}) succeeded.")
                     
+                except FloodWaitError as e:
+                    # Back off on per-account flood waits
+                    seconds = int(getattr(e, 'seconds', 0) or 0)
+                    max_wait = getattr(config, 'MAX_FLOOD_WAIT_SECONDS', 300)
+                    logger.warning(f"FloodWait during report request from {account_name} (****{phone_last4}): {seconds}s")
+                    if seconds > max_wait:
+                        account_failed += 1
+                        report_results["failed"] += 1
+                        logger.error(f"FloodWait too long ({seconds}s). Marking cycle {cycle}/{cycles} as failed.")
+                    else:
+                        await asyncio.sleep(seconds + 1)
+                        # retry once after waiting
+                        try:
+                            await user_client(ReportPeerRequest(
+                                peer=target_entity,
+                                reason=reason,
+                                message=report_message
+                            ))
+                            account_success += 1
+                            report_results["success"] += 1
+                        except Exception as e2:
+                            account_failed += 1
+                            report_results["failed"] += 1
+                            logger.error(f"Report retry {cycle}/{cycles} from {account_name} failed: {e2}")
+
                 except Exception as e:
                     account_failed += 1
                     report_results["failed"] += 1
@@ -755,7 +878,8 @@ async def mass_report_from_all_accounts(channel_username, message_id, reason, re
                     success_rate = (report_results["success"] / total_done * 100) if total_done > 0 else 0
                     
                     try:
-                        await status_msg.edit(
+                        await safe_edit_message(
+                            status_msg,
                             "🔄 **Report Started**\n\n"
                             f"**Count:** {total_done}\n"
                             f"✅ **Success:** {report_results['success']}\n"
@@ -794,7 +918,8 @@ async def mass_report_from_all_accounts(channel_username, message_id, reason, re
     success_rate = (report_results["success"] / total_done * 100) if total_done > 0 else 0
     
     try:
-        await status_msg.edit(
+        await safe_edit_message(
+            status_msg,
             "✅ **Report Complete**\n\n"
             f"👥 **Total Accounts:** {total_sessions}\n"
             f"✅ **Success:** {report_results['success']}\n"
@@ -872,7 +997,8 @@ async def mass_report_from_all_accounts(channel_username, message_id, reason, re
         json.dump(report_data, f, indent=2, ensure_ascii=False)
     
     # Send file to user
-    await main_bot.send_file(
+    await safe_send_file(
+        main_bot,
         initiator_id,
         filename,
         caption=f"📊 **Detailed Report Log**\n\n"
@@ -903,7 +1029,7 @@ async def mass_report_user(username, reason, reason_text, initiator_id, cycles=1
 
     if not sessions:
         logger.warning(f"No active sessions found for user {initiator_id}.")
-        await main_bot.send_message(initiator_id, "❌ No active accounts/sessions found. Add an account first with `/add`.")
+        await safe_send_message(main_bot, initiator_id, "❌ No active accounts/sessions found. Add an account first with `/add`.")
         return
 
     report_results = {"success": 0, "failed": 0, "errors": [], "details": []}
@@ -913,7 +1039,8 @@ async def mass_report_user(username, reason, reason_text, initiator_id, cycles=1
     logger.info(f"Starting user report for {initiator_id} with {total_sessions} sessions, {cycles} cycles")
 
     # Send initial status message (will be edited)
-    status_msg = await main_bot.send_message(
+    status_msg = await safe_send_message(
+        main_bot,
         initiator_id,
         "🔄 **Report Started**\n\n"
         f"👥 **Total Accounts:** {total_sessions}\n"
@@ -1023,7 +1150,8 @@ async def mass_report_user(username, reason, reason_text, initiator_id, cycles=1
     success_rate = (report_results["success"] / total_done * 100) if total_done > 0 else 0
     
     try:
-        await status_msg.edit(
+        await safe_edit_message(
+            status_msg,
             "✅ **Report Complete**\n\n"
             f"👥 **Total Accounts:** {total_sessions}\n"
             f"✅ **Success:** {report_results['success']}\n"
@@ -1097,7 +1225,8 @@ async def mass_report_user(username, reason, reason_text, initiator_id, cycles=1
         json.dump(report_data, f, indent=2, ensure_ascii=False)
     
     # Send file to user
-    await main_bot.send_file(
+    await safe_send_file(
+        main_bot,
         initiator_id,
         filename,
         caption=f"📊 **Detailed Report Log**\n\n"
@@ -1128,7 +1257,7 @@ async def mass_report_channel(channel_username, reason, reason_text, initiator_i
 
     if not sessions:
         logger.warning(f"No active sessions found for user {initiator_id}.")
-        await main_bot.send_message(initiator_id, "❌ No active accounts/sessions found. Add an account first with `/add`.")
+        await safe_send_message(main_bot, initiator_id, "❌ No active accounts/sessions found. Add an account first with `/add`.")
         return
 
     report_results = {"success": 0, "failed": 0, "errors": [], "details": []}
@@ -1138,7 +1267,8 @@ async def mass_report_channel(channel_username, reason, reason_text, initiator_i
     logger.info(f"Starting channel report for user {initiator_id} with {total_sessions} sessions, {cycles} cycles")
 
     # Send initial status message (will be edited)
-    status_msg = await main_bot.send_message(
+    status_msg = await safe_send_message(
+        main_bot,
         initiator_id,
         "🔄 **Report Started**\n\n"
         f"**Count:** 0\n"
@@ -1248,7 +1378,8 @@ async def mass_report_channel(channel_username, reason, reason_text, initiator_i
     success_rate = (report_results["success"] / total_done * 100) if total_done > 0 else 0
     
     try:
-        await status_msg.edit(
+        await safe_edit_message(
+            status_msg,
             "✅ **Report Complete**\n\n"
             f"👥 **Total Accounts:** {total_sessions}\n"
             f"✅ **Success:** {report_results['success']}\n"
@@ -1324,7 +1455,8 @@ async def mass_report_channel(channel_username, reason, reason_text, initiator_i
         json.dump(report_data, f, indent=2, ensure_ascii=False)
     
     # Send file to user
-    await main_bot.send_file(
+    await safe_send_file(
+        main_bot,
         initiator_id,
         filename,
         caption=f"📊 **Detailed Report Log**\n\n"
